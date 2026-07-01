@@ -7,33 +7,31 @@
  * Security:
  *   • refreshToken is set as an httpOnly cookie — never in response body
  *   • accessToken is returned in body — stored in memory only (frontend)
- *   • Session is created on every successful login
+ *   • Sessions / RefreshTokens are recorded and rotated on each call
  */
 
 const authService = require("../services/authService");
-const { Session } = require("../models");
 const logger = require("../config/logger");
 
-/** Shared cookie options for the refresh token. */
-const REFRESH_COOKIE_OPTIONS = {
+/** Shared cookie options for the refresh token (30 days expiry). */
+const getRefreshCookieOptions = () => ({
   httpOnly: true,
-  secure: process.env.NODE_ENV === "production",
+  // Works seamlessly on both localhost and HTTPS-secured Vercel deployments
+  secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
   sameSite: "strict",
-  path: "/api/auth",          // only sent to auth endpoints
-  maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-};
+  path: "/api/auth", // only sent to auth endpoints
+  maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
+});
 
 /**
  * POST /api/auth/google
  * Authenticate via Google OAuth ID token.
- *
- * @param {import("express").Request} req
- * @param {import("express").Response} res
- * @param {import("express").NextFunction} next
  */
 async function googleLogin(req, res, next) {
   try {
     const { idToken } = req.body;
+    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const userAgent = req.headers["user-agent"] || "unknown";
 
     if (!idToken) {
       return res.status(400).json({
@@ -42,30 +40,18 @@ async function googleLogin(req, res, next) {
       });
     }
 
-    const result = await authService.googleLogin(idToken);
-
-    // Create anti-piracy session
-    await Session.create({
-      user: result.user.id,
-      note: null,
-      ip: req.ip || req.headers["x-forwarded-for"] || "unknown",
-      userAgent: req.headers["user-agent"] || "unknown",
-      deviceFingerprint: req.headers["x-device-fingerprint"] || null,
-      isActive: true,
-      lastActiveAt: new Date(),
-    });
+    const result = await authService.googleLogin(idToken, ip, userAgent);
 
     // Set refresh token as httpOnly cookie
-    res.cookie("refreshToken", result.refreshToken, REFRESH_COOKIE_OPTIONS);
+    res.cookie("refreshToken", result.refreshToken, getRefreshCookieOptions());
 
-    // Return only accessToken + user in body (no refreshToken)
     res.status(200).json({
       success: true,
       data: {
         accessToken: result.accessToken,
         user: result.user,
       },
-      message: "Login successful",
+      message: "Google login successful",
     });
   } catch (err) {
     next(err);
@@ -75,14 +61,17 @@ async function googleLogin(req, res, next) {
 /**
  * POST /api/auth/otp/send
  * Send a 6-digit OTP to the given email.
- *
- * @param {import("express").Request} req
- * @param {import("express").Response} res
- * @param {import("express").NextFunction} next
  */
 async function sendOTP(req, res, next) {
   try {
     const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: "Email address is required",
+      });
+    }
 
     await authService.sendOTP(email);
 
@@ -98,32 +87,25 @@ async function sendOTP(req, res, next) {
 /**
  * POST /api/auth/otp/verify
  * Verify the OTP and return access token (refresh token set as cookie).
- *
- * @param {import("express").Request} req
- * @param {import("express").Response} res
- * @param {import("express").NextFunction} next
  */
 async function verifyOTP(req, res, next) {
   try {
     const { email, otp } = req.body;
+    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const userAgent = req.headers["user-agent"] || "unknown";
 
-    const result = await authService.verifyOTP(email, otp);
+    if (!email || !otp) {
+      return res.status(400).json({
+        success: false,
+        message: "Email and OTP code are required",
+      });
+    }
 
-    // Create anti-piracy session
-    await Session.create({
-      user: result.user.id,
-      note: null,
-      ip: req.ip || req.headers["x-forwarded-for"] || "unknown",
-      userAgent: req.headers["user-agent"] || "unknown",
-      deviceFingerprint: req.headers["x-device-fingerprint"] || null,
-      isActive: true,
-      lastActiveAt: new Date(),
-    });
+    const result = await authService.verifyOTP(email, otp, ip, userAgent);
 
     // Set refresh token as httpOnly cookie
-    res.cookie("refreshToken", result.refreshToken, REFRESH_COOKIE_OPTIONS);
+    res.cookie("refreshToken", result.refreshToken, getRefreshCookieOptions());
 
-    // Return only accessToken + user in body (no refreshToken)
     res.status(200).json({
       success: true,
       data: {
@@ -139,15 +121,13 @@ async function verifyOTP(req, res, next) {
 
 /**
  * POST /api/auth/refresh
- * Issue a new access token using the refresh token from httpOnly cookie.
- *
- * @param {import("express").Request} req
- * @param {import("express").Response} res
- * @param {import("express").NextFunction} next
+ * Issue a new access token and rotated refresh token using the refresh token from httpOnly cookie.
  */
 async function refreshToken(req, res, next) {
   try {
     const token = req.cookies?.refreshToken;
+    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
+    const userAgent = req.headers["user-agent"] || "unknown";
 
     if (!token) {
       return res.status(401).json({
@@ -156,41 +136,48 @@ async function refreshToken(req, res, next) {
       });
     }
 
-    const result = await authService.refreshAccessToken(token);
+    // Call service to perform rotation and verify token
+    const result = await authService.refreshAccessToken(token, ip, userAgent);
+
+    // Set the new rotated refresh token in cookie
+    res.cookie("refreshToken", result.refreshToken, getRefreshCookieOptions());
 
     return res.status(200).json({
       success: true,
-      data: result,
+      data: {
+        accessToken: result.accessToken,
+      },
     });
   } catch (err) {
-    // Token expired or invalid — return 401 immediately, never hang
+    // Make sure to clear cookie on invalidation
+    res.clearCookie("refreshToken", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
+      sameSite: "strict",
+      path: "/api/auth",
+    });
     return res.status(401).json({
       success: false,
-      message: "Invalid or expired refresh token",
+      message: err.message || "Invalid or expired refresh token",
     });
   }
 }
 
 /**
  * POST /api/auth/logout
- * Invalidate the current session and clear the refresh cookie.
- *
- * @param {import("express").Request} req
- * @param {import("express").Response} res
- * @param {import("express").NextFunction} next
+ * Invalidate the current refresh token and clear cookie.
  */
 async function logout(req, res, next) {
   try {
-    await authService.logout(
-      req.user.id,
-      req.ip,
-      req.headers["user-agent"] || ""
-    );
+    const token = req.cookies?.refreshToken;
+    const userId = req.user.id;
+
+    await authService.logout(userId, token);
 
     // Clear the httpOnly refresh token cookie
     res.clearCookie("refreshToken", {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
       sameSite: "strict",
       path: "/api/auth",
     });
@@ -204,4 +191,31 @@ async function logout(req, res, next) {
   }
 }
 
-module.exports = { googleLogin, sendOTP, verifyOTP, refreshToken, logout };
+/**
+ * GET /api/auth/me
+ * Retrieve the currently authenticated user profile.
+ */
+async function getMe(req, res, next) {
+  try {
+    const userId = req.user.id;
+    const user = await authService.getUserProfile(userId);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        user,
+      },
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+module.exports = {
+  googleLogin,
+  sendOTP,
+  verifyOTP,
+  refreshToken,
+  logout,
+  getMe,
+};

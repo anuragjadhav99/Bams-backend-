@@ -208,6 +208,9 @@ async function getUsers({ page, limit, skip, search, role, accountStatus, sortBy
         role: 1,
         accountStatus: 1,
         authProvider: 1,
+        loginMethod: 1,
+        failedOTPAttempts: 1,
+        lastLoginAt: 1,
         createdAt: 1,
         totalOrders: 1,
         totalSpent: 1

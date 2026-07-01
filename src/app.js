@@ -8,11 +8,12 @@
  * @module app
  */
 
+// 1. Require statements
 const express = require("express");
-const helmet = require("helmet");
 const cors = require("cors");
 const cookieParser = require("cookie-parser");
 const morgan = require("morgan");
+const helmet = require("helmet");
 const { env } = require("./config/env");
 const logger = require("./config/logger");
 const { setupSwagger } = require("./docs/swagger");
@@ -20,12 +21,12 @@ const { setupSwagger } = require("./docs/swagger");
 // Register all Mongoose models (side-effect: compiles schemas)
 require("./models");
 
-// ── Middleware imports ─────────────────────────────────────────────
+// Middleware imports
 const { apiLimiter } = require("./middleware/rateLimiter");
 const { trimStrings } = require("./middleware/sanitize");
 const errorHandler = require("./middleware/errorHandler");
 
-// ── Route imports ─────────────────────────────────────────────────
+// Route imports
 const healthRoutes = require("./routes/health");
 const authRoutes = require("./routes/auth");
 const notesRoutes = require("./routes/notes");
@@ -36,7 +37,7 @@ const adminRoutes = require("./routes/admin");
 
 const app = express();
 
-/* ── CORS — restricted to frontend URL only ────────────────────── */
+// 2. CORS configurations
 const corsOptions = {
   origin: "http://localhost:3000",
   credentials: true,
@@ -45,27 +46,14 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 
-// Explicitly respond to ALL OPTIONS preflight requests.
-// Without this, the browser's preflight hangs and the POST never fires.
-// Express 5 + path-to-regexp v8: glob wildcards removed; use a JS RegExp instead.
+// 3. OPTIONS preflight handler (Express 5 + path-to-regexp v8 RegExp wildcard compatible)
 app.options(/.*/, cors(corsOptions));
 
-/* ── Security headers ──────────────────────────────────────────── */
-app.use(helmet());
+// 4. Cookie parser
+app.use(cookieParser());
 
-
-/* ── Request logging ───────────────────────────────────────────── */
-app.use(
-  morgan("dev", {
-    stream: {
-      write: (message) => logger.info(message.trim(), { category: "http" }),
-    },
-  })
-);
-
-/* ── Body parsing ──────────────────────────────────────────────── */
-// Raw body for Razorpay webhook signature verification
-// Must be BEFORE express.json() for the webhook route
+// 5. Raw body parser for webhook, followed by express.json()
+// Raw body for Razorpay webhook signature verification must be BEFORE express.json()
 app.use("/api/payment/webhook", express.raw({ type: "application/json" }), (req, _res, next) => {
   req.rawBody = req.body.toString("utf-8");
   try {
@@ -75,31 +63,47 @@ app.use("/api/payment/webhook", express.raw({ type: "application/json" }), (req,
   }
   next();
 });
-
-// JSON body parser for all other routes
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
-/* ── Cookie parsing ────────────────────────────────────────────── */
-app.use(cookieParser());
+// 6. Morgan logger
+app.use(
+  morgan("dev", {
+    stream: {
+      write: (message) => logger.info(message.trim(), { category: "http" }),
+    },
+  })
+);
 
-/* ── Input sanitization ────────────────────────────────────────── */
+// 7. Helmet headers
+app.use(helmet());
+
+// 8. Health check endpoint (including /api/health as inline fallback)
+app.get("/api/health", (req, res) => {
+  res.json({ success: true, message: "Server is running" });
+});
+app.use("/api/health", healthRoutes); // Include full structured health info if hit explicitly
+
+// 9. Input sanitization (trim strings) and Global rate limiter
 app.use(trimStrings);
-
-/* ── Global rate limiter ───────────────────────────────────────── */
 app.use("/api", apiLimiter);
 
-/* ── Swagger API docs ──────────────────────────────────────────── */
+// Swagger API docs setup
 setupSwagger(app);
 
-/* ── Routes ────────────────────────────────────────────────────── */
-app.use("/api/health", healthRoutes);
+// 10. Auth Router
 app.use("/api/auth", authRoutes);
-app.use("/api", notesRoutes);          // mounts /api/subjects and /api/notes
+
+// 11. Notes Router
+app.use("/api", notesRoutes); // mounts /api/subjects and /api/notes
+
+// 12. Admin Router
+app.use("/api/admin", adminRoutes);
+
+// 13. All other routes
 app.use("/api/reader", readerRoutes);
 app.use("/api/payment", paymentRoutes);
 app.use("/api/user", userRoutes);
-app.use("/api/admin", adminRoutes);
 
 app.get("/", (_req, res) => {
   res.json({
@@ -110,7 +114,6 @@ app.get("/", (_req, res) => {
   });
 });
 
-/* ── 404 handler ───────────────────────────────────────────────── */
 app.use((_req, res) => {
   res.status(404).json({
     success: false,
@@ -118,7 +121,7 @@ app.use((_req, res) => {
   });
 });
 
-/* ── Global error handler (must be last) ───────────────────────── */
+// 14. Global error handler (must be last)
 app.use(errorHandler);
 
 module.exports = app;

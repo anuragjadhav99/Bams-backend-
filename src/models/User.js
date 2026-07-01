@@ -107,6 +107,16 @@ const userSchema = new Schema(
       type: Date,
       default: null,
     },
+
+    loginMethod: {
+      type: String,
+      default: null, // "google" or "email_otp"
+    },
+
+    failedOTPAttempts: {
+      type: Number,
+      default: 0,
+    },
   },
   {
     timestamps: true, // adds createdAt, updatedAt
@@ -123,5 +133,9 @@ userSchema.index({ phone: 1 }, { unique: true, sparse: true });
 userSchema.methods.isActive = function () {
   return this.accountStatus === "active";
 };
+
+userSchema.virtual("googleLinked").get(function () {
+  return !!this.googleId;
+});
 
 module.exports = mongoose.model("User", userSchema);

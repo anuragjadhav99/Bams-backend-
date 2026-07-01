@@ -10,6 +10,8 @@ const Page = require("./Page");
 const Order = require("./Order");
 const Subscription = require("./Subscription");
 const Session = require("./Session");
+const OTP = require("./OTP");
+const RefreshToken = require("./RefreshToken");
 
 module.exports = {
   User,
@@ -19,4 +21,6 @@ module.exports = {
   Order,
   Subscription,
   Session,
+  OTP,
+  RefreshToken,
 };
