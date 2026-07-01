@@ -158,12 +158,16 @@ async function refreshToken(req, res, next) {
 
     const result = await authService.refreshAccessToken(token);
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
       data: result,
     });
   } catch (err) {
-    next(err);
+    // Token expired or invalid — return 401 immediately, never hang
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired refresh token",
+    });
   }
 }
 

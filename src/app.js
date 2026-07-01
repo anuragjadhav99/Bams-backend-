@@ -37,14 +37,18 @@ const adminRoutes = require("./routes/admin");
 const app = express();
 
 /* ── CORS — restricted to frontend URL only ────────────────────── */
-app.use(
-  cors({
-    origin: "http://localhost:3000",
-    credentials: true,
-    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+const corsOptions = {
+  origin: "http://localhost:3000",
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+app.use(cors(corsOptions));
+
+// Explicitly respond to ALL OPTIONS preflight requests.
+// Without this, the browser's preflight hangs and the POST never fires.
+// Express 5 + path-to-regexp v8: glob wildcards removed; use a JS RegExp instead.
+app.options(/.*/, cors(corsOptions));
 
 /* ── Security headers ──────────────────────────────────────────── */
 app.use(helmet());
