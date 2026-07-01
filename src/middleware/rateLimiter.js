@@ -19,7 +19,7 @@ const FIFTEEN_MINUTES = 15 * 60 * 1000;
  */
 const authLimiter = rateLimit({
   windowMs: FIFTEEN_MINUTES,
-  max: 10,
+  max: 100,
   standardHeaders: true,
   legacyHeaders: false,
   message: {

@@ -62,7 +62,6 @@ const userSchema = new Schema(
 
     googleId: {
       type: String,
-      default: null,
     },
 
     /** Last OTP hash — only relevant for email_otp provider. */

@@ -36,22 +36,19 @@ const adminRoutes = require("./routes/admin");
 
 const app = express();
 
-/* ── Security headers ──────────────────────────────────────────── */
-app.use(helmet());
-
 /* ── CORS — restricted to frontend URL only ────────────────────── */
 app.use(
   cors({
-    origin: env.FRONTEND_URL,
+    origin: "http://localhost:3000",
     credentials: true,
-    methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allowedHeaders: [
-      "Content-Type",
-      "Authorization",
-      "X-Device-Fingerprint",
-    ],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
+
+/* ── Security headers ──────────────────────────────────────────── */
+app.use(helmet());
+
 
 /* ── Request logging ───────────────────────────────────────────── */
 app.use(

@@ -31,14 +31,20 @@ async function connectDB() {
 
   const uri = process.env.MONGODB_URI || "mongodb://localhost:27017/bams_study_notes";
 
-  cached = mongoose.connect(uri, {
-    // Mongoose 8 uses the new driver defaults; these are explicit for clarity.
-    autoIndex: process.env.NODE_ENV !== "production", // disable auto-index in prod
-  });
+  try {
+    cached = mongoose.connect(uri, {
+      // Mongoose 8 uses the new driver defaults; these are explicit for clarity.
+      autoIndex: process.env.NODE_ENV !== "production", // disable auto-index in prod
+    });
 
-  await cached;
-  console.log(`✅  MongoDB connected → ${mongoose.connection.host}`);
-  return cached;
+    await cached;
+    console.log(`✅  MongoDB connected → ${mongoose.connection.host}`);
+    return cached;
+  } catch (err) {
+    console.error("❌ MongoDB connection error:", err.message);
+    cached = null; // Reset cached connection promise on failure so next call retries
+    throw err;
+  }
 }
 
 module.exports = connectDB;
