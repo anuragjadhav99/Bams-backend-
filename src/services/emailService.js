@@ -8,6 +8,7 @@
  */
 
 const { getTransport } = require("../config/email");
+const { env } = require("../config/env");
 const logger = require("../config/logger");
 
 /**
