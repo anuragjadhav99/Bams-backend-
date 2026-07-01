@@ -67,8 +67,8 @@ const transports = [
   }),
 ];
 
-// In production, also write to files
-if (!isDev) {
+// In production, also write to files (skip on Vercel — read-only filesystem)
+if (!isDev && !process.env.VERCEL) {
   transports.push(
     new winston.transports.File({
       filename: "logs/error.log",

@@ -9,7 +9,8 @@
     "seed": "node src/seeds/seedSubjects.js",
     "validate": "node src/scripts/validateSchemas.js",
     "test": "jest --forceExit --detectOpenHandles",
-    "test:watch": "jest --watch --forceExit --detectOpenHandles"
+    "test:watch": "jest --watch --forceExit --detectOpenHandles",
+    "vercel-build": "echo 'No build step required'"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1075.0",
@@ -29,6 +30,7 @@
     "morgan": "^1.11.0",
     "nodemailer": "^9.0.1",
     "razorpay": "^2.9.6",
+    "serverless-http": "^4.0.0",
     "swagger-jsdoc": "^6.3.0",
     "swagger-ui-express": "^5.0.1",
     "winston": "^3.19.0"
@@ -42,7 +44,7 @@
     "js-yaml": "^4.1.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": "22.x"
   },
   "license": "UNLICENSED",
   "private": true
