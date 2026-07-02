@@ -1,62 +1,72 @@
 /**
  * Authentication Service.
  *
- * Business logic for authentication flows:
- *   • Google OAuth verification + user creation
- *   • OTP generation, hashing, verification (with security constraints)
- *   • JWT token generation (access + refresh) with Refresh Token Rotation
- *   • Session / RefreshToken revocation on logout or compromise
+ * Business logic for all authentication flows:
+ *   • Google OAuth 2.0 — verify ID token, create/link user, issue tokens
+ *   • Email OTP — generate, hash, send, verify with security constraints
+ *   • Refresh Token Rotation — SHA256-hashed tokens, theft detection
+ *   • Logout — hash + delete specific token from DB
+ *   • Profile fetch — sanitised user object for /me endpoint
  *
- * Security rules:
- *   ❌ Never logs OTP values, tokens, or secrets
- *   ✅ Logs auth events with userId, email, provider, ip
+ * Security rules enforced here:
+ *   ❌ Never log OTP plaintext, raw refresh tokens, or JWT secrets
+ *   ✅ Log auth events with userId, email, provider, ip (no secrets)
+ *   ✅ All refresh tokens stored as SHA256 hashes
+ *   ✅ OTP stored as bcrypt hash (cost 10)
  */
 
+"use strict";
+
+const crypto = require("crypto");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const { OAuth2Client } = require("google-auth-library");
-const { User, Session, OTP, RefreshToken } = require("../models");
+
+const { User, OTP, RefreshToken } = require("../models");
 const { env } = require("../config/env");
 const logger = require("../config/logger");
 const { sendOTPEmail } = require("./emailService");
 
-/** Google OAuth client singleton. */
+// ── Constants ────────────────────────────────────────────────────────
+
 const googleClient = new OAuth2Client(env.GOOGLE_CLIENT_ID);
 
-/** OTP expiry time in milliseconds (5 minutes). */
-const OTP_EXPIRY_MS = 5 * 60 * 1000;
-
-/** Access token expiry. */
 const ACCESS_TOKEN_EXPIRY = "15m";
 
-/** Refresh token expiry (30 days). */
-const REFRESH_TOKEN_EXPIRY = "30d";
+// Cookie / DB lifetime for refresh tokens
+const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// ── Helpers ──────────────────────────────────────────────────────────
 
 /**
- * Generate JWT access + refresh token pair.
+ * Generate a short-lived JWT access token.
  *
  * @param {Object} user - Mongoose User document
- * @returns {{ accessToken: string, refreshToken: string }}
+ * @returns {string} signed JWT
  */
-function generateTokens(user) {
-  const payload = { id: user._id.toString(), role: user.role };
-
-  const accessToken = jwt.sign(payload, env.JWT_ACCESS_SECRET, {
-    expiresIn: ACCESS_TOKEN_EXPIRY,
-  });
-
-  const refreshToken = jwt.sign(payload, env.JWT_REFRESH_SECRET, {
-    expiresIn: REFRESH_TOKEN_EXPIRY,
-  });
-
-  return { accessToken, refreshToken };
+function generateAccessToken(user) {
+  return jwt.sign(
+    { id: user._id.toString(), role: user.role },
+    env.JWT_ACCESS_SECRET,
+    { expiresIn: ACCESS_TOKEN_EXPIRY }
+  );
 }
 
 /**
- * Format user object for client response.
- * Strips sensitive fields.
+ * Generate a cryptographically random raw refresh token.
+ * The raw value goes into the cookie; the hash is stored in the DB.
  *
- * @param {Object} user - Mongoose User document
+ * @returns {string} 128-char hex string
+ */
+function generateRawRefreshToken() {
+  return crypto.randomBytes(64).toString("hex");
+}
+
+/**
+ * Format a Mongoose User document into a safe client-facing object.
+ * Never returns sensitive fields (OTP data, hashes, etc.).
+ *
+ * @param {Object} user
  * @returns {Object}
  */
 function formatUser(user) {
@@ -65,23 +75,53 @@ function formatUser(user) {
     name: user.name,
     email: user.email,
     role: user.role,
-    avatar: user.avatar,
+    avatar: user.avatar || null,
     phone: user.phone || null,
     loginMethod: user.loginMethod || "email_otp",
     googleLinked: !!user.googleId,
-    lastLoginAt: user.lastLoginAt,
+    lastLoginAt: user.lastLoginAt || null,
+    createdAt: user.createdAt,
   };
 }
 
 /**
- * Authenticate via Google OAuth.
+ * Persist a new refresh token (hashed) in the database.
  *
- * @param {string} idToken - Google ID token from the client
- * @param {string} ip - Request IP address
- * @param {string} userAgent - Request user agent
- * @returns {Promise<{ accessToken, refreshToken, user }>}
+ * @param {string}   rawToken
+ * @param {ObjectId} userId
+ * @param {Object}   req  - Express request for ip / userAgent
+ * @returns {Promise<void>}
  */
-async function googleLogin(idToken, ip, userAgent) {
+async function saveRefreshToken(rawToken, userId, req) {
+  const hash = RefreshToken.hashToken(rawToken);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_TTL_MS);
+
+  await RefreshToken.create({
+    token: hash,
+    user: userId,
+    expiresAt,
+    ip: req?.ip || req?.headers?.["x-forwarded-for"] || "unknown",
+    userAgent: req?.headers?.["user-agent"] || "unknown",
+  });
+}
+
+// ── Auth flows ───────────────────────────────────────────────────────
+
+/**
+ * Authenticate via Google OAuth 2.0.
+ *
+ * • Verifies the idToken with google-auth-library.
+ * • Creates a new user on first login or links an existing account.
+ * • Issues access token (JWT) + raw refresh token.
+ * • Stores hashed refresh token in DB.
+ *
+ * @param {string} idToken
+ * @param {Object} req - Express request
+ * @returns {Promise<{ accessToken: string, rawRefreshToken: string, user: Object }>}
+ */
+async function googleLogin(idToken, req) {
+  const ip = req?.ip || req?.headers?.["x-forwarded-for"] || "unknown";
+
   let ticket;
   try {
     ticket = await googleClient.verifyIdToken({
@@ -90,35 +130,31 @@ async function googleLogin(idToken, ip, userAgent) {
     });
   } catch (err) {
     logger.auth("login_failed", { provider: "google", ip, error: err.message });
-    throw Object.assign(new Error("Google Login failed: invalid token"), { statusCode: 401 });
+    const e = new Error("Google login failed — invalid token");
+    e.statusCode = 401;
+    throw e;
   }
 
-  const googlePayload = ticket.getPayload();
-
-  if (!googlePayload || !googlePayload.email) {
-    logger.auth("login_failed", { provider: "google", ip, error: "No email returned from Google" });
-    throw Object.assign(new Error("Invalid Google token"), { statusCode: 401 });
+  const payload = ticket.getPayload();
+  if (!payload?.email) {
+    const e = new Error("Invalid Google token — no email");
+    e.statusCode = 401;
+    throw e;
   }
 
-  const { sub: googleId, email, name, picture } = googlePayload;
+  const { sub: googleId, email, name, picture } = payload;
 
-  // Find existing user by googleId or email
-  let user = await User.findOne({
-    $or: [{ googleId }, { email }],
-  });
+  // Find by googleId first, then fall back to email (account linking)
+  let user = await User.findOne({ $or: [{ googleId }, { email }] });
 
   if (user) {
-    // Update Google info if needed (Account linking)
-    if (!user.googleId) {
-      user.googleId = googleId;
-      user.authProvider = "google";
-    }
+    if (!user.googleId) user.googleId = googleId; // Link account
+    user.authProvider = "google";
     user.loginMethod = "google";
     user.avatar = picture || user.avatar;
     user.lastLoginAt = new Date();
     await user.save();
   } else {
-    // Create new user automatically on first-time login
     user = await User.create({
       name: name || email.split("@")[0],
       email,
@@ -131,290 +167,221 @@ async function googleLogin(idToken, ip, userAgent) {
   }
 
   if (!user.isActive()) {
-    logger.auth("login_failed", { userId: user._id, email: user.email, provider: "google", ip, error: "Account suspended" });
-    throw Object.assign(new Error("Account is suspended"), { statusCode: 403 });
+    logger.auth("login_failed", { provider: "google", userId: user._id, ip, error: "Account suspended" });
+    const e = new Error("Account is suspended");
+    e.statusCode = 403;
+    throw e;
   }
 
-  const tokens = generateTokens(user);
+  const accessToken = generateAccessToken(user);
+  const rawRefreshToken = generateRawRefreshToken();
+  await saveRefreshToken(rawRefreshToken, user._id, req);
 
-  // Store refresh token in RefreshToken database collection
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
-  await RefreshToken.create({
-    user: user._id,
-    token: tokens.refreshToken,
-    ip,
-    userAgent,
-    expiresAt,
-  });
+  logger.auth("login", { userId: user._id, email: user.email, provider: "google", ip });
 
-  logger.auth("login", {
-    userId: user._id,
-    email: user.email,
-    provider: "google",
-    ip,
-  });
-
-  return {
-    ...tokens,
-    user: formatUser(user),
-  };
+  return { accessToken, rawRefreshToken, user: formatUser(user) };
 }
 
 /**
- * Generate and send an OTP to the given email.
+ * Generate and send a 6-digit OTP to the given email.
  *
- * Implements security checks:
- *   • Enforces 30 seconds resend delay
- *   • Enforces maximum 5 resends limit
- *   • Invalidates previous OTPs
+ * Security constraints enforced:
+ *   1. 30-second resend delay — checked via createdAt of existing OTP doc.
+ *   2. Maximum 5 resends in this window.
+ *   3. Previous OTP document is deleted before creating a new one.
+ *   4. Plaintext OTP is discarded after sendOTPEmail() returns.
  *
  * @param {string} email
- * @returns {Promise<void>}
+ * @returns {Promise<{ success: true }>}
  */
 async function sendOTP(email) {
   const normalizedEmail = email.toLowerCase().trim();
 
-  // Find if there is an active OTP document
-  const existingOTP = await OTP.findOne({ email: normalizedEmail });
+  // Check for existing OTP document
+  const existing = await OTP.findOne({ email: normalizedEmail });
 
-  if (existingOTP) {
-    // 1. Enforce 30 seconds resend delay
-    const timeSinceLastResend = Date.now() - existingOTP.lastResentAt.getTime();
-    if (timeSinceLastResend < 30 * 1000) {
-      throw Object.assign(
-        new Error(`Please wait ${Math.ceil((30 * 1000 - timeSinceLastResend) / 1000)}s before requesting a new OTP`),
-        { statusCode: 429 }
-      );
+  if (existing) {
+    // Enforce 30-second delay between resends (using createdAt of current doc)
+    const secondsSinceCreated = (Date.now() - existing.createdAt.getTime()) / 1000;
+    if (secondsSinceCreated < 30) {
+      const waitSec = Math.ceil(30 - secondsSinceCreated);
+      const e = new Error(`Please wait ${waitSec} seconds before resending`);
+      e.statusCode = 429;
+      throw e;
     }
 
-    // 2. Enforce maximum 5 resends
-    if (existingOTP.resends >= 5) {
-      throw Object.assign(
-        new Error("Maximum resend attempts reached (5 times). Please wait 5 minutes before trying again."),
-        { statusCode: 429 }
-      );
+    // Enforce maximum 5 resends
+    if (existing.resends >= 5) {
+      const e = new Error("Maximum resend limit reached");
+      e.statusCode = 429;
+      throw e;
     }
-
-    // 3. Delete/Invalidate previous OTP
-    await OTP.deleteOne({ _id: existingOTP._id });
   }
 
-  // Generate random 6-digit OTP
-  const otpCode = String(Math.floor(100000 + Math.random() * 900000));
+  // Carry the resend count forward so it persists across deletes
+  const nextResends = existing ? existing.resends + 1 : 0;
 
-  // Hash the OTP
-  const otpHash = await bcrypt.hash(otpCode, 10);
-  const expiresAt = new Date(Date.now() + OTP_EXPIRY_MS);
-  const nextResendCount = existingOTP ? existingOTP.resends + 1 : 0;
+  // Delete the old doc before creating a new one (invalidates previous OTP)
+  if (existing) {
+    await OTP.deleteOne({ _id: existing._id });
+  }
 
-  // Save new OTP
+  // Generate 6-digit OTP
+  const otp = Math.floor(100000 + Math.random() * 900000).toString();
+  const otpHash = await bcrypt.hash(otp, 10);
+
   await OTP.create({
     email: normalizedEmail,
     otpHash,
-    resends: nextResendCount,
-    lastResentAt: new Date(),
-    expiresAt,
+    resends: nextResends,
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
   });
 
-  // Send via Nodemailer (Never logs the code)
-  await sendOTPEmail(normalizedEmail, otpCode);
+  // Send email — plaintext OTP is not stored or logged after this call
+  await sendOTPEmail(normalizedEmail, otp);
 
   logger.auth("otp_sent", { email: normalizedEmail });
+
+  return { success: true };
 }
 
 /**
- * Verify OTP and authenticate/create user.
+ * Verify a 6-digit OTP and authenticate/create the user.
  *
- * Implements security checks:
- *   • Max 5 failed attempts limit
- *   • Immediate invalidation on success or max failures
+ * Security constraints enforced:
+ *   1. OTP document must exist (not expired via TTL).
+ *   2. Maximum 5 failed attempts before doc is deleted.
+ *   3. bcrypt comparison of plaintext against stored hash.
+ *   4. OTP document deleted immediately on success (prevents replay).
+ *   5. User created via findOneAndUpdate upsert (atomic, no duplicates).
  *
  * @param {string} email
- * @param {string} otpCode
- * @param {string} ip
- * @param {string} userAgent
- * @returns {Promise<{ accessToken, refreshToken, user }>}
+ * @param {string} otpCode    - 6-digit plaintext code from the user
+ * @param {Object} req        - Express request (for ip / userAgent)
+ * @returns {Promise<{ accessToken: string, rawRefreshToken: string, user: Object }>}
  */
-async function verifyOTP(email, otpCode, ip, userAgent) {
+async function verifyOTP(email, otpCode, req) {
   const normalizedEmail = email.toLowerCase().trim();
+  const ip = req?.ip || req?.headers?.["x-forwarded-for"] || "unknown";
 
-  // Find the OTP document
+  // Step 1: Find the OTP document
   const otpDoc = await OTP.findOne({ email: normalizedEmail });
-
   if (!otpDoc) {
-    throw Object.assign(new Error("No OTP requested for this email"), { statusCode: 400 });
+    const e = new Error("OTP expired or not found");
+    e.statusCode = 400;
+    throw e;
   }
 
-  // Check if expired
-  if (otpDoc.expiresAt < new Date()) {
-    await OTP.deleteOne({ _id: otpDoc._id });
-    throw Object.assign(new Error("OTP has expired — request a new one"), { statusCode: 400 });
-  }
-
-  // Find user to log administrative failed attempts
-  let user = await User.findOne({ email: normalizedEmail });
-
-  // Check failed verification attempts limit (max 5)
+  // Step 2: Too many attempts — delete and reject
   if (otpDoc.attempts >= 5) {
     await OTP.deleteOne({ _id: otpDoc._id });
-
-    if (user) {
-      user.failedOTPAttempts += 1;
-      await user.save();
-    }
-
-    logger.auth("login_failed", { email: normalizedEmail, ip, error: "Too many failed OTP attempts" });
-    throw Object.assign(new Error("Too many failed attempts. This OTP has been invalidated."), { statusCode: 400 });
+    logger.auth("login_failed", { email: normalizedEmail, ip, error: "Too many OTP attempts" });
+    const e = new Error("Too many attempts. Request a new OTP.");
+    e.statusCode = 400;
+    throw e;
   }
 
-  // Compare hashed OTP
-  const isValid = await bcrypt.compare(otpCode, otpDoc.otpHash);
-
-  if (!isValid) {
-    // Increment attempts on OTP document
+  // Step 3: Compare OTP
+  const valid = await bcrypt.compare(otpCode, otpDoc.otpHash);
+  if (!valid) {
     otpDoc.attempts += 1;
     await otpDoc.save();
-
-    if (user) {
-      user.failedOTPAttempts += 1;
-      await user.save();
-    }
-
-    logger.auth("login_failed", { email: normalizedEmail, ip, error: "Invalid OTP digit match" });
-    throw Object.assign(new Error("Invalid OTP code"), { statusCode: 400 });
+    logger.auth("login_failed", { email: normalizedEmail, ip, error: "Invalid OTP" });
+    const e = new Error("Invalid OTP");
+    e.statusCode = 400;
+    throw e;
   }
 
-  // OTP is valid!
-  // Find or create user
-  if (!user) {
-    user = await User.create({
-      name: normalizedEmail.split("@")[0],
-      email: normalizedEmail,
-      authProvider: "email_otp",
-      loginMethod: "email_otp",
-      lastLoginAt: new Date(),
-    });
-  } else {
-    user.loginMethod = "email_otp";
-    user.lastLoginAt = new Date();
-    user.failedOTPAttempts = 0; // Reset failed attempts count
-    await user.save();
-  }
-
-  if (!user.isActive()) {
-    await OTP.deleteOne({ _id: otpDoc._id });
-    logger.auth("login_failed", { userId: user._id, email: user.email, provider: "email_otp", ip, error: "Account suspended" });
-    throw Object.assign(new Error("Account is suspended"), { statusCode: 403 });
-  }
-
-  const tokens = generateTokens(user);
-
-  // Store refresh token in RefreshToken database collection
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
-  await RefreshToken.create({
-    user: user._id,
-    token: tokens.refreshToken,
-    ip,
-    userAgent,
-    expiresAt,
-  });
-
-  // Delete the OTP document immediately to prevent replay attacks
+  // Step 4: Delete OTP doc immediately (prevents replay)
   await OTP.deleteOne({ _id: otpDoc._id });
 
-  logger.auth("login", {
-    userId: user._id,
-    email: user.email,
-    provider: "email_otp",
-    ip,
-  });
+  // Step 5: Find or create user atomically via upsert
+  const user = await User.findOneAndUpdate(
+    { email: normalizedEmail },
+    {
+      $set: {
+        lastLoginAt: new Date(),
+        authProvider: "email_otp",
+        loginMethod: "email_otp",
+        failedOTPAttempts: 0,
+      },
+      $setOnInsert: {
+        name: normalizedEmail.split("@")[0],
+        email: normalizedEmail,
+      },
+    },
+    { upsert: true, new: true }
+  );
 
-  return {
-    ...tokens,
-    user: formatUser(user),
-  };
+  if (!user.isActive()) {
+    logger.auth("login_failed", { email: normalizedEmail, ip, error: "Account suspended" });
+    const e = new Error("Account is suspended");
+    e.statusCode = 403;
+    throw e;
+  }
+
+  // Step 6: Issue tokens
+  const accessToken = generateAccessToken(user);
+  const rawRefreshToken = generateRawRefreshToken();
+  await saveRefreshToken(rawRefreshToken, user._id, req);
+
+  logger.auth("login", { userId: user._id, email: user.email, provider: "email_otp", ip });
+
+  return { accessToken, rawRefreshToken, user: formatUser(user) };
 }
 
 /**
- * Rotate Refresh Token and return new token pair.
+ * Rotate a refresh token — validate, delete old, issue new.
  *
- * Implements Refresh Token Rotation and Theft Detection:
- *   • If a refresh token is reused (not found in database, but JWT valid),
- *     we suspect theft/hijack and revoke all sessions/tokens for that user.
+ * Delegates the core rotation logic to RefreshToken.findAndRotate().
+ * If the token has already been rotated (reuse attack), findAndRotate
+ * throws 401 and the caller clears the cookie.
  *
- * @param {string} oldRefreshToken
- * @param {string} ip
- * @param {string} userAgent
- * @returns {Promise<{ accessToken: string, refreshToken: string }>}
+ * @param {string} rawToken - Raw token from the httpOnly cookie
+ * @param {Object} req      - Express request
+ * @returns {Promise<{ accessToken: string, newRawRefreshToken: string, user: Object }>}
  */
-async function refreshAccessToken(oldRefreshToken, ip, userAgent) {
-  let decoded;
-  try {
-    decoded = jwt.verify(oldRefreshToken, env.JWT_REFRESH_SECRET);
-  } catch (err) {
-    logger.auth("token_refresh_failed", { ip, error: "Invalid refresh token signature" });
-    throw Object.assign(new Error("Invalid refresh token signature"), { statusCode: 401 });
-  }
+async function rotateRefreshToken(rawToken, req) {
+  const ip = req?.ip || req?.headers?.["x-forwarded-for"] || "unknown";
 
-  // Check if token exists in database
-  const tokenDoc = await RefreshToken.findOne({ token: oldRefreshToken });
+  // findAndRotate handles: hash lookup, theft detection, delete old, create new
+  const { newRawToken: newRawRefreshToken, userId } = await RefreshToken.findAndRotate(rawToken, req);
 
-  if (!tokenDoc) {
-    // CRITICAL: Potential token reuse (hijacking attempt)!
-    // Invalidate ALL tokens/sessions for the user as a safety defense
-    await RefreshToken.deleteMany({ user: decoded.id });
-    logger.warn(`SECURITY ALERT: Refresh token reuse detected. Revoking all tokens.`, {
-      category: "security",
-      userId: decoded.id,
-      ip,
-    });
-    throw Object.assign(new Error("Session expired — security violation detected"), { statusCode: 401 });
-  }
-
-  // Find user and make sure active
-  const user = await User.findById(decoded.id);
+  const user = await User.findById(userId);
   if (!user || !user.isActive()) {
-    await RefreshToken.deleteOne({ _id: tokenDoc._id });
-    throw Object.assign(new Error("User not found or suspended"), { statusCode: 401 });
+    const e = new Error("User not found or suspended");
+    e.statusCode = 401;
+    throw e;
   }
 
-  // Delete the used refresh token (Rotation)
-  await RefreshToken.deleteOne({ _id: tokenDoc._id });
-
-  // Generate new token pair
-  const tokens = generateTokens(user);
-
-  // Save new refresh token
-  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000); // 30 days
-  await RefreshToken.create({
-    user: user._id,
-    token: tokens.refreshToken,
-    ip,
-    userAgent,
-    expiresAt,
-  });
+  const accessToken = generateAccessToken(user);
 
   logger.auth("token_refresh", { userId: user._id, ip });
 
-  return tokens;
+  return { accessToken, newRawRefreshToken, user: formatUser(user) };
 }
 
 /**
- * Revoke specific refresh token on logout.
+ * Logout — revoke the specific refresh token and log the event.
+ *
+ * The raw token from the cookie is hashed and the matching DB doc deleted.
+ * If the token is missing or already expired, we still return success
+ * (idempotent logout).
  *
  * @param {string} userId
- * @param {string} token
+ * @param {string|undefined} rawToken - Raw token from the httpOnly cookie
  * @returns {Promise<void>}
  */
-async function logout(userId, token) {
-  if (token) {
-    await RefreshToken.deleteOne({ user: userId, token });
+async function logout(userId, rawToken) {
+  if (rawToken) {
+    const hash = RefreshToken.hashToken(rawToken);
+    await RefreshToken.deleteOne({ user: userId, token: hash });
   }
   logger.auth("logout", { userId });
 }
 
 /**
- * Fetch and return sanitized user profile.
+ * Fetch the sanitised profile for the currently authenticated user.
  *
  * @param {string} userId
  * @returns {Promise<Object>}
@@ -422,18 +389,24 @@ async function logout(userId, token) {
 async function getUserProfile(userId) {
   const user = await User.findById(userId);
   if (!user || !user.isActive()) {
-    throw Object.assign(new Error("User not found or inactive"), { statusCode: 404 });
+    const e = new Error("User not found or inactive");
+    e.statusCode = 404;
+    throw e;
   }
   return formatUser(user);
 }
+
+// ── Exports ──────────────────────────────────────────────────────────
 
 module.exports = {
   googleLogin,
   sendOTP,
   verifyOTP,
-  refreshAccessToken,
+  rotateRefreshToken,
   logout,
   getUserProfile,
-  generateTokens,
+  // Exposed for testing
+  generateAccessToken,
+  generateRawRefreshToken,
   formatUser,
 };

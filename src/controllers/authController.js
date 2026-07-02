@@ -1,57 +1,70 @@
 /**
  * Auth Controller.
  *
- * Thin controller layer — validates request, calls authService,
- * returns response. No business logic here.
+ * Thin controller layer — parses the request, delegates to authService,
+ * sets/clears the httpOnly cookie, and returns a uniform JSON response.
  *
- * Security:
- *   • refreshToken is set as an httpOnly cookie — never in response body
- *   • accessToken is returned in body — stored in memory only (frontend)
- *   • Sessions / RefreshTokens are recorded and rotated on each call
+ * No business logic lives here.
+ *
+ * Cookie policy:
+ *   • refreshToken  → httpOnly, Secure (prod/Vercel), SameSite=Strict
+ *   • maxAge        → 7 days (spec: 7 days for cookie lifetime)
+ *   • path          → /api/auth  (cookie only sent to auth endpoints)
  */
 
-const authService = require("../services/authService");
-const logger = require("../config/logger");
+"use strict";
 
-/** Shared cookie options for the refresh token (30 days expiry). */
-const getRefreshCookieOptions = () => ({
-  httpOnly: true,
-  // Works seamlessly on both localhost and HTTPS-secured Vercel deployments
-  secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
-  sameSite: "strict",
-  path: "/api/auth", // only sent to auth endpoints
-  maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-});
+const authService = require("../services/authService");
+
+// ── Cookie helpers ────────────────────────────────────────────────────
+
+const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Options for setting the refresh-token cookie.
+ * secure=true in production and on Vercel; false on localhost.
+ */
+function getRefreshCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
+    sameSite: "strict",
+    path: "/api/auth",
+    maxAge: SEVEN_DAYS_MS,
+  };
+}
+
+function getClearCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
+    sameSite: "strict",
+    path: "/api/auth",
+  };
+}
+
+// ── Controllers ───────────────────────────────────────────────────────
 
 /**
  * POST /api/auth/google
- * Authenticate via Google OAuth ID token.
+ * Verify Google ID token, create/link user, set cookie, return access token.
  */
 async function googleLogin(req, res, next) {
   try {
     const { idToken } = req.body;
-    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
-    const userAgent = req.headers["user-agent"] || "unknown";
 
     if (!idToken) {
-      return res.status(400).json({
-        success: false,
-        message: "Google ID token is required",
-      });
+      return res.status(400).json({ success: false, message: "Google ID token is required" });
     }
 
-    const result = await authService.googleLogin(idToken, ip, userAgent);
+    const { accessToken, rawRefreshToken, user } = await authService.googleLogin(idToken, req);
 
-    // Set refresh token as httpOnly cookie
-    res.cookie("refreshToken", result.refreshToken, getRefreshCookieOptions());
+    res.cookie("refreshToken", rawRefreshToken, getRefreshCookieOptions());
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      data: {
-        accessToken: result.accessToken,
-        user: result.user,
-      },
       message: "Google login successful",
+      data: { accessToken, user },
     });
   } catch (err) {
     next(err);
@@ -60,25 +73,19 @@ async function googleLogin(req, res, next) {
 
 /**
  * POST /api/auth/otp/send
- * Send a 6-digit OTP to the given email.
+ * Generate and email a 6-digit OTP to the given address.
  */
 async function sendOTP(req, res, next) {
   try {
     const { email } = req.body;
 
     if (!email) {
-      return res.status(400).json({
-        success: false,
-        message: "Email address is required",
-      });
+      return res.status(400).json({ success: false, message: "Email address is required" });
     }
 
     await authService.sendOTP(email);
 
-    res.status(200).json({
-      success: true,
-      message: "OTP sent to your email",
-    });
+    return res.status(200).json({ success: true, message: "OTP sent to your email" });
   } catch (err) {
     next(err);
   }
@@ -86,33 +93,25 @@ async function sendOTP(req, res, next) {
 
 /**
  * POST /api/auth/otp/verify
- * Verify the OTP and return access token (refresh token set as cookie).
+ * Verify OTP, set httpOnly refresh-token cookie, return access token + user.
  */
 async function verifyOTP(req, res, next) {
   try {
     const { email, otp } = req.body;
-    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
-    const userAgent = req.headers["user-agent"] || "unknown";
 
     if (!email || !otp) {
-      return res.status(400).json({
-        success: false,
-        message: "Email and OTP code are required",
-      });
+      return res.status(400).json({ success: false, message: "Email and OTP code are required" });
     }
 
-    const result = await authService.verifyOTP(email, otp, ip, userAgent);
+    const { accessToken, rawRefreshToken, user } = await authService.verifyOTP(email, otp, req);
 
-    // Set refresh token as httpOnly cookie
-    res.cookie("refreshToken", result.refreshToken, getRefreshCookieOptions());
+    // httpOnly cookie — 7 days
+    res.cookie("refreshToken", rawRefreshToken, getRefreshCookieOptions());
 
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      data: {
-        accessToken: result.accessToken,
-        user: result.user,
-      },
       message: "OTP verified — login successful",
+      data: { accessToken, user },
     });
   } catch (err) {
     next(err);
@@ -121,41 +120,31 @@ async function verifyOTP(req, res, next) {
 
 /**
  * POST /api/auth/refresh
- * Issue a new access token and rotated refresh token using the refresh token from httpOnly cookie.
+ * Rotate the refresh token and issue a new access token.
+ *
+ * Reads raw token from req.cookies.refreshToken.
+ * Returns 401 immediately if missing — never hangs.
  */
-async function refreshToken(req, res, next) {
+async function refreshToken(req, res) {
+  const rawToken = req.cookies?.refreshToken;
+
+  if (!rawToken) {
+    return res.status(401).json({ success: false, message: "No refresh token — please log in" });
+  }
+
   try {
-    const token = req.cookies?.refreshToken;
-    const ip = req.ip || req.headers["x-forwarded-for"] || "unknown";
-    const userAgent = req.headers["user-agent"] || "unknown";
+    const { accessToken, newRawRefreshToken } = await authService.rotateRefreshToken(rawToken, req);
 
-    if (!token) {
-      return res.status(401).json({
-        success: false,
-        message: "No refresh token — please log in",
-      });
-    }
-
-    // Call service to perform rotation and verify token
-    const result = await authService.refreshAccessToken(token, ip, userAgent);
-
-    // Set the new rotated refresh token in cookie
-    res.cookie("refreshToken", result.refreshToken, getRefreshCookieOptions());
+    // Set the rotated refresh token
+    res.cookie("refreshToken", newRawRefreshToken, getRefreshCookieOptions());
 
     return res.status(200).json({
       success: true,
-      data: {
-        accessToken: result.accessToken,
-      },
+      data: { accessToken },
     });
   } catch (err) {
-    // Make sure to clear cookie on invalidation
-    res.clearCookie("refreshToken", {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
-      sameSite: "strict",
-      path: "/api/auth",
-    });
+    // Clear invalid/expired cookie so the browser doesn't keep sending it
+    res.clearCookie("refreshToken", getClearCookieOptions());
     return res.status(401).json({
       success: false,
       message: err.message || "Invalid or expired refresh token",
@@ -165,27 +154,19 @@ async function refreshToken(req, res, next) {
 
 /**
  * POST /api/auth/logout
- * Invalidate the current refresh token and clear cookie.
+ * Hash the raw token from the cookie, delete the DB record, clear cookie.
  */
 async function logout(req, res, next) {
   try {
-    const token = req.cookies?.refreshToken;
+    const rawToken = req.cookies?.refreshToken;
     const userId = req.user.id;
 
-    await authService.logout(userId, token);
+    // Hash and delete; no-op if token is missing or already expired
+    await authService.logout(userId, rawToken);
 
-    // Clear the httpOnly refresh token cookie
-    res.clearCookie("refreshToken", {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production" || !!process.env.VERCEL,
-      sameSite: "strict",
-      path: "/api/auth",
-    });
+    res.clearCookie("refreshToken", getClearCookieOptions());
 
-    res.status(200).json({
-      success: true,
-      message: "Logged out successfully",
-    });
+    return res.status(200).json({ success: true, message: "Logged out successfully" });
   } catch (err) {
     next(err);
   }
@@ -193,29 +174,18 @@ async function logout(req, res, next) {
 
 /**
  * GET /api/auth/me
- * Retrieve the currently authenticated user profile.
+ * Return the sanitised profile of the currently authenticated user.
+ * verifyToken middleware already ran, so req.user.id is safe to use.
  */
 async function getMe(req, res, next) {
   try {
-    const userId = req.user.id;
-    const user = await authService.getUserProfile(userId);
-
-    res.status(200).json({
-      success: true,
-      data: {
-        user,
-      },
-    });
+    const user = await authService.getUserProfile(req.user.id);
+    return res.status(200).json({ success: true, data: { user } });
   } catch (err) {
     next(err);
   }
 }
 
-module.exports = {
-  googleLogin,
-  sendOTP,
-  verifyOTP,
-  refreshToken,
-  logout,
-  getMe,
-};
+// ── Exports ───────────────────────────────────────────────────────────
+
+module.exports = { googleLogin, sendOTP, verifyOTP, refreshToken, logout, getMe };

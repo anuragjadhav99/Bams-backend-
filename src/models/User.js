@@ -64,18 +64,6 @@ const userSchema = new Schema(
       type: String,
     },
 
-    /** Last OTP hash — only relevant for email_otp provider. */
-    otpHash: {
-      type: String,
-      default: null,
-      select: false, // never sent to the client by default
-    },
-
-    otpExpiresAt: {
-      type: Date,
-      default: null,
-      select: false,
-    },
 
     /* ── role & status ────────────────────────────────────────── */
     role: {
